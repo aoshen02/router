@@ -539,8 +539,13 @@ async fn create_worker(
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         }
     } else {
-        // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url).await {
+        // In single router mode, keep the labels: they are what an `x-worker-group`
+        // request header matches against when selecting a worker.
+        match state
+            .router
+            .add_worker_with_labels(&config.url, config.labels.clone())
+            .await
+        {
             Ok(message) => {
                 let response = WorkerApiResponse {
                     success: true,
@@ -589,6 +594,7 @@ async fn list_workers_rest(
                     "connection_mode": format!("{:?}", worker.connection_mode()),
                     "priority": worker.priority(),
                     "cost": worker.cost(),
+                    "labels": worker.metadata().labels,
                 });
 
                 // Add bootstrap_port for Prefill workers

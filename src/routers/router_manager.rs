@@ -450,18 +450,28 @@ impl RouterManager {
 impl WorkerManagement for RouterManager {
     /// Add a worker - in multi-router mode, this adds to the registry
     async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        // Create a basic worker config request
+        self.add_worker_with_labels(worker_url, std::collections::HashMap::new())
+            .await
+    }
+
+    /// The registry stores labels, so keep them instead of taking the trait's
+    /// drop-and-warn default.
+    async fn add_worker_with_labels(
+        &self,
+        worker_url: &str,
+        labels: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
             model_id: None,
             worker_type: None,
             priority: None,
             cost: None,
-            labels: std::collections::HashMap::new(),
+            labels,
             bootstrap_port: None,
         };
 
-        match self.add_worker(config).await {
+        match RouterManager::add_worker(self, config).await {
             Ok(response) => Ok(response.message),
             Err(e) => Err(e.error),
         }

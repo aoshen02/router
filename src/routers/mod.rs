@@ -7,7 +7,9 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use std::collections::HashMap;
 use std::fmt::Debug;
+use tracing::warn;
 
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
@@ -31,6 +33,26 @@ pub use http::{openai_router, pd_router, pd_types, router};
 pub trait WorkerManagement: Send + Sync {
     /// Add a worker to the router
     async fn add_worker(&self, worker_url: &str) -> Result<String, String>;
+
+    /// Add a worker carrying labels/tags. Labels let a request select a subset of
+    /// workers (see the `x-worker-group` header). A router that does not support
+    /// labels still registers the worker -- dropping a label is not worth failing
+    /// a registration over -- but says so, because the alternative is a request
+    /// header that silently stops selecting anything.
+    async fn add_worker_with_labels(
+        &self,
+        worker_url: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<String, String> {
+        if !labels.is_empty() {
+            warn!(
+                "Router does not support worker labels; dropping {:?} for {}",
+                labels.keys().collect::<Vec<_>>(),
+                worker_url
+            );
+        }
+        self.add_worker(worker_url).await
+    }
 
     /// Remove a worker from the router
     fn remove_worker(&self, worker_url: &str);
