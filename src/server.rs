@@ -9,7 +9,7 @@ use crate::{
     protocols::{
         spec::{
             ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            RerankRequest, V1RerankReqInput,
+            InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -224,6 +224,21 @@ async fn generate(
     state
         .router
         .route_generate(Some(&headers), &body, None)
+        .await
+}
+
+async fn inference_generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<InferenceGenerateRequest>,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    state
+        .router
+        .route_inference_generate(Some(&headers), &body, None)
         .await
 }
 
@@ -524,8 +539,13 @@ async fn create_worker(
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         }
     } else {
-        // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url).await {
+        // In single router mode, keep the labels: they are what an `x-worker-group`
+        // request header matches against when selecting a worker.
+        match state
+            .router
+            .add_worker_with_labels(&config.url, config.labels.clone())
+            .await
+        {
             Ok(message) => {
                 let response = WorkerApiResponse {
                     success: true,
@@ -574,6 +594,7 @@ async fn list_workers_rest(
                     "connection_mode": format!("{:?}", worker.connection_mode()),
                     "priority": worker.priority(),
                     "cost": worker.cost(),
+                    "labels": worker.metadata().labels,
                 });
 
                 // Add bootstrap_port for Prefill workers
@@ -705,6 +726,7 @@ pub fn build_app_with_request_tracing(
     // Create routes
     let protected_routes = Router::new()
         .route("/generate", post(generate))
+        .route("/inference/v1/generate", post(inference_generate))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))

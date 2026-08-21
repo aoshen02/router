@@ -7,8 +7,8 @@
 use crate::config::RouterConfig;
 use crate::core::{CircuitBreakerConfig, Worker, WorkerFactory, WorkerRegistry, WorkerType};
 use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesRequest,
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
+    InferenceGenerateRequest, RerankRequest, ResponsesRequest,
 };
 use crate::protocols::worker_spec::{
     ServerInfo, WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse, WorkerInfo,
@@ -450,18 +450,28 @@ impl RouterManager {
 impl WorkerManagement for RouterManager {
     /// Add a worker - in multi-router mode, this adds to the registry
     async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        // Create a basic worker config request
+        self.add_worker_with_labels(worker_url, std::collections::HashMap::new())
+            .await
+    }
+
+    /// The registry stores labels, so keep them instead of taking the trait's
+    /// drop-and-warn default.
+    async fn add_worker_with_labels(
+        &self,
+        worker_url: &str,
+        labels: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
         let config = WorkerConfigRequest {
             url: worker_url.to_string(),
             model_id: None,
             worker_type: None,
             priority: None,
             cost: None,
-            labels: std::collections::HashMap::new(),
+            labels,
             bootstrap_port: None,
         };
 
-        match self.add_worker(config).await {
+        match RouterManager::add_worker(self, config).await {
             Ok(response) => Ok(response.message),
             Err(e) => Err(e.error),
         }
@@ -564,6 +574,25 @@ impl RouterTrait for RouterManager {
             router.route_generate(headers, body, None).await
         } else {
             // Return 404 when no router is available for the request
+            (
+                StatusCode::NOT_FOUND,
+                "No router available for this request",
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, None);
+
+        if let Some(router) = router {
+            router.route_inference_generate(headers, body, None).await
+        } else {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for this request",

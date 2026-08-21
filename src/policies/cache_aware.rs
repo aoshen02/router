@@ -338,11 +338,24 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return Some(idx);
         }
 
-        // Selected worker no longer exists or unhealthy, remove stale tenant from tree
+        // The tenant was matched but not chosen. Two very different reasons look
+        // the same from here: it is registered and unhealthy, or it was never a
+        // candidate for this request (an `x-worker-group` header narrows the set).
+        // Only the first is stale. Evicting on the second destroys the cache map
+        // of every worker outside the requested group, so alternating groups would
+        // wipe each other's affinity. Tenants of workers that really did go away
+        // are reclaimed by the size-based eviction instead.
         if match_rate > self.config.cache_threshold {
             let tenant_url: &str = &result.tenant;
-            tree.remove_tenant(tenant_url);
-            debug!("Removed stale worker {} from cache tree", tenant_url);
+            if workers.iter().any(|w| w.url() == tenant_url) {
+                tree.remove_tenant(tenant_url);
+                debug!("Removed stale worker {} from cache tree", tenant_url);
+            } else {
+                debug!(
+                    "Tenant {} is not a candidate for this request; keeping its cache",
+                    tenant_url
+                );
+            }
         }
 
         // Fallback to first healthy worker

@@ -8,7 +8,7 @@ use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
-    RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
+    InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
 };
 use crate::routers::header_utils;
 use crate::routers::http::dp_utils;
@@ -30,6 +30,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
+
+/// Request header naming the worker group this request prefers. Honoured whenever
+/// that group has a healthy member; otherwise the request falls back to the full
+/// worker set rather than failing. See `confine_to_worker_group`.
+pub const WORKER_GROUP_HEADER: &str = "x-worker-group";
+/// Worker label holding the group name, set at registration time.
+pub const WORKER_GROUP_LABEL: &str = "group";
 
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
@@ -486,6 +493,62 @@ impl Router {
         }
     }
 
+    /// Read the group a request asks for, if any.
+    ///
+    /// A header that is present but empty or undecodable routes like no header at
+    /// all -- the same fallback the rest of this feature uses -- but says so, since
+    /// otherwise a client sending a mangled value looks exactly like one sending
+    /// none while believing its requests are being confined.
+    fn requested_worker_group(headers: Option<&HeaderMap>) -> Option<&str> {
+        let value = headers.and_then(|h| h.get(WORKER_GROUP_HEADER))?;
+        match value.to_str().map(str::trim) {
+            Ok(group) if !group.is_empty() => Some(group),
+            _ => {
+                warn!(
+                    "Ignoring unusable {} header ({} bytes); routing unconfined",
+                    WORKER_GROUP_HEADER,
+                    value.as_bytes().len()
+                );
+                None
+            }
+        }
+    }
+
+    /// Narrow `workers` to the group the request asks for.
+    ///
+    /// Returns every worker when no group is asked for, and falls back to every
+    /// worker when the group is unknown or has nothing healthy left. That fallback
+    /// is deliberate: the label is a preference, and a hard failure would let one
+    /// bad group take the router down. Callers wanting strict confinement must
+    /// check the label themselves.
+    fn confine_to_worker_group(
+        workers: Vec<Arc<dyn Worker>>,
+        headers: Option<&HeaderMap>,
+    ) -> Vec<Arc<dyn Worker>> {
+        let Some(group) = Self::requested_worker_group(headers) else {
+            return workers;
+        };
+        let in_group: Vec<Arc<dyn Worker>> = workers
+            .iter()
+            .filter(|w| {
+                w.metadata()
+                    .labels
+                    .get(WORKER_GROUP_LABEL)
+                    .is_some_and(|g| g == group)
+            })
+            .cloned()
+            .collect();
+        if in_group.is_empty() {
+            warn!(
+                "No available worker in group '{}'; falling back to all {} workers",
+                group,
+                workers.len()
+            );
+            return workers;
+        }
+        in_group
+    }
+
     /// Convert axum HeaderMap to policy RequestHeaders (HashMap<String, String>)
     fn headers_to_request_headers(
         headers: Option<&HeaderMap>,
@@ -523,6 +586,8 @@ impl Router {
         if available.is_empty() {
             return None;
         }
+
+        let available = Self::confine_to_worker_group(available, headers);
 
         // Get the appropriate policy for this model
         let policy = match model_id {
@@ -1005,6 +1070,17 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        self.add_worker_with_labels(worker_url, HashMap::new())
+            .await
+    }
+
+    /// Same as `add_worker`, but stamps the worker with labels so that requests
+    /// carrying an `x-worker-group` header can be confined to a subset of workers.
+    pub async fn add_worker_with_labels(
+        &self,
+        worker_url: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<String, String> {
         let start_time = std::time::Instant::now();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
@@ -1053,7 +1129,8 @@ impl Router {
                                     self.intra_node_data_parallel_size,
                                     WorkerType::Regular,
                                 )
-                                .with_circuit_breaker_config(self.circuit_breaker_config.clone());
+                                .with_circuit_breaker_config(self.circuit_breaker_config.clone())
+                                .with_labels(labels.clone());
 
                                 let worker_arc: Arc<dyn Worker> = Arc::new(new_worker);
                                 self.worker_registry.register(worker_arc.clone());
@@ -1090,7 +1167,8 @@ impl Router {
                                 BasicWorker::new(worker_url.to_string(), WorkerType::Regular)
                                     .with_circuit_breaker_config(
                                         self.circuit_breaker_config.clone(),
-                                    );
+                                    )
+                                    .with_labels(labels.clone());
 
                             let worker_arc = Arc::new(new_worker);
                             self.worker_registry.register(worker_arc.clone());
@@ -1388,6 +1466,14 @@ impl WorkerManagement for Router {
         Router::add_worker(self, worker_url).await
     }
 
+    async fn add_worker_with_labels(
+        &self,
+        worker_url: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<String, String> {
+        Router::add_worker_with_labels(self, worker_url, labels).await
+    }
+
     fn remove_worker(&self, worker_url: &str) {
         Router::remove_worker(self, worker_url)
     }
@@ -1445,6 +1531,16 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)
+            .await
+    }
+
+    async fn route_inference_generate(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &InferenceGenerateRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/inference/v1/generate", model_id)
             .await
     }
 
@@ -1657,6 +1753,10 @@ impl RouterTrait for Router {
             .filter(|w| w.is_available())
             .cloned()
             .collect();
+        // Honour x-worker-group here too: this is the path /v1/responses takes,
+        // and a header that works on one endpoint but not another is worse than
+        // one that does not exist.
+        let workers = Self::confine_to_worker_group(workers, headers);
         if workers.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1930,6 +2030,107 @@ mod tests {
                 i, url, first
             );
         }
+    }
+
+    fn create_test_grouped_router() -> Router {
+        let router = create_test_consistent_hash_router();
+        // worker1/2 are the throughput pool, worker3 is the latency pool.
+        for w in router.worker_registry.get_all() {
+            let group = if w.url() == "http://worker3:8080" {
+                "low_latency"
+            } else {
+                "high_throughput"
+            };
+            // Workers are registered through Arc<dyn Worker>, so re-register a labelled copy.
+            let labelled = BasicWorker::new(w.url().to_string(), WorkerType::Regular).with_labels(
+                HashMap::from([(WORKER_GROUP_LABEL.to_string(), group.to_string())]),
+            );
+            router.worker_registry.register(Arc::new(labelled));
+        }
+        router
+    }
+
+    fn group_header(group: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(WORKER_GROUP_HEADER, HeaderValue::from_str(group).unwrap());
+        h
+    }
+
+    #[test]
+    fn test_worker_group_header_confines_selection_to_that_group() {
+        let router = create_test_grouped_router();
+        let headers = group_header("low_latency");
+
+        // Every request must land on the single low_latency worker, whatever the
+        // policy would otherwise have picked.
+        for _ in 0..20 {
+            let worker = router
+                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&headers))
+                .expect("a low_latency worker exists");
+            assert_eq!(worker.url(), "http://worker3:8080");
+        }
+    }
+
+    #[test]
+    fn test_multi_member_group_stays_inside_the_group() {
+        // The single-worker case cannot tell confinement apart from "only one
+        // candidate". high_throughput has two members, so the policy still gets a
+        // choice -- and every choice must be inside the group.
+        let router = create_test_grouped_router();
+        let headers = group_header("high_throughput");
+        for i in 0..50 {
+            let text = format!(r#"{{"prompt": "test-{}"}}"#, i);
+            let worker = router
+                .select_worker_for_model(None, Some(&text), Some(&headers))
+                .expect("a high_throughput worker exists");
+            assert_ne!(worker.url(), "http://worker3:8080");
+        }
+    }
+
+    #[test]
+    fn test_no_group_header_uses_all_workers() {
+        let router = create_test_grouped_router();
+        // Without the header the group labels must not narrow anything down: the
+        // throughput workers stay reachable.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..50 {
+            let text = format!(r#"{{"prompt": "test-{}"}}"#, i);
+            let worker = router
+                .select_worker_for_model(None, Some(&text), None)
+                .expect("some worker is selected");
+            seen.insert(worker.url().to_string());
+        }
+        assert!(
+            seen.contains("http://worker1:8080") || seen.contains("http://worker2:8080"),
+            "unlabelled requests must still reach the throughput pool, saw {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_unknown_group_falls_back_instead_of_failing() {
+        // A tag is a preference. Asking for a group that does not exist must not
+        // take the router down -- it must serve the request from whatever is up.
+        let router = create_test_grouped_router();
+        let headers = group_header("does_not_exist");
+        let worker =
+            router.select_worker_for_model(None, Some(r#"{"prompt": "x"}"#), Some(&headers));
+        assert!(worker.is_some(), "unknown group must fall back, not 503");
+    }
+
+    #[test]
+    fn test_group_falls_back_when_every_member_is_unhealthy() {
+        let router = create_test_grouped_router();
+        for w in router.worker_registry.get_all() {
+            if w.url() == "http://worker3:8080" {
+                w.set_healthy(false);
+            }
+        }
+        let headers = group_header("low_latency");
+        let worker = router
+            .select_worker_for_model(None, Some(r#"{"prompt": "x"}"#), Some(&headers))
+            .expect("must fall back to the healthy throughput workers");
+        assert_ne!(worker.url(), "http://worker3:8080");
     }
 
     #[test]

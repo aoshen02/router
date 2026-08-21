@@ -4,7 +4,7 @@
 //! session ID or user ID, ensuring that requests from the same user/session are
 //! consistently routed to the same worker for better cache locality.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use tracing::debug;
@@ -24,19 +24,32 @@ pub const VIRTUAL_NODES_PER_WORKER: u32 = 160;
 ///
 /// Routes requests based on session ID or user ID using consistent hashing,
 /// ensuring that requests from the same user/session consistently go to the same worker.
+/// The worker URLs a request may choose from; identifies the ring built for them.
+type CandidateSet = Vec<String>;
+
+/// Hash position -> worker URL.
+type HashRing = BTreeMap<u64, String>;
+
 #[derive(Debug)]
 pub struct ConsistentHashPolicy {
-    /// Hash ring mapping hash values to worker URLs
-    hash_ring: RwLock<BTreeMap<u64, String>>,
-    /// Current set of workers (for detecting changes)
-    current_workers: RwLock<Vec<String>>,
+    /// One hash ring per distinct candidate set, keyed by that set's worker URLs.
+    ///
+    /// A single shared ring was enough while every request saw the same workers.
+    /// An `x-worker-group` header narrows the candidates per request, so requests
+    /// now alternate between sets; with one ring each alternation rebuilt it and
+    /// moved sessions that should have been pinned. Rings are cheap and the number
+    /// of distinct sets is the number of groups plus one.
+    rings: RwLock<HashMap<CandidateSet, Arc<HashRing>>>,
 }
+
+/// Rings are only rebuilt on worker churn, but a long-lived router that churns
+/// often would otherwise accumulate one dead ring per historical set.
+const MAX_CACHED_RINGS: usize = 32;
 
 impl ConsistentHashPolicy {
     pub fn new() -> Self {
         Self {
-            hash_ring: RwLock::new(BTreeMap::new()),
-            current_workers: RwLock::new(Vec::new()),
+            rings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -245,19 +258,15 @@ impl ConsistentHashPolicy {
         )
     }
 
-    /// Update the hash ring when workers change
-    fn update_hash_ring(&self, workers: &[Arc<dyn Worker>]) {
+    /// The ring for this candidate set, building it on first use.
+    fn ring_for(&self, workers: &[Arc<dyn Worker>]) -> Arc<HashRing> {
         let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
 
-        // Check if workers have changed
-        {
-            let current = self.current_workers.read().unwrap();
-            if *current == worker_urls {
-                return; // No change needed
-            }
+        if let Some(ring) = self.rings.read().unwrap().get(&worker_urls) {
+            return Arc::clone(ring);
         }
 
-        // Rebuild hash ring
+        // Build the ring for this set
         let mut new_ring = BTreeMap::new();
 
         for worker_url in &worker_urls {
@@ -269,28 +278,27 @@ impl ConsistentHashPolicy {
             }
         }
 
-        // Update both the ring and current workers
+        let ring = Arc::new(new_ring);
         {
-            let mut ring = self.hash_ring.write().unwrap();
-            *ring = new_ring;
-        }
-        {
-            let mut current = self.current_workers.write().unwrap();
-            *current = worker_urls;
+            let mut rings = self.rings.write().unwrap();
+            if rings.len() >= MAX_CACHED_RINGS {
+                rings.clear();
+            }
+            rings.insert(worker_urls, Arc::clone(&ring));
         }
 
         info!(
-            "Updated consistent hash ring with {} workers and {} virtual nodes",
+            "Built consistent hash ring for {} workers with {} virtual nodes",
             workers.len(),
             workers.len() as u32 * VIRTUAL_NODES_PER_WORKER
         );
+        ring
     }
 
-    /// Find the worker for a given hash key using consistent hashing
-    fn find_worker_by_hash(&self, hash_key: &str) -> Option<String> {
+    /// Find the worker for a given hash key on the given ring
+    fn find_worker_by_hash(ring: &HashRing, hash_key: &str) -> Option<String> {
         let hash_value = Self::fbi_hash(hash_key);
 
-        let ring = self.hash_ring.read().unwrap();
         if ring.is_empty() {
             return None;
         }
@@ -340,8 +348,10 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
             return None;
         }
 
-        // Update hash ring if needed
-        self.update_hash_ring(workers);
+        // The ring for exactly this candidate set. An x-worker-group header
+        // narrows the set per request, so a single shared ring would be rebuilt
+        // on every alternation and move sessions that should have stayed pinned.
+        let ring = self.ring_for(workers);
 
         // Extract hash key with priority: headers > body > fallback
         let hash_key = hash_key::extract_hash_key(request_text, headers);
@@ -359,7 +369,7 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
         info!("CONSISTENT_HASH_DEBUG: Extracted hash key: {}", hash_key);
 
         // Find target worker using consistent hashing
-        let target_worker_url = match self.find_worker_by_hash(&hash_key) {
+        let target_worker_url = match Self::find_worker_by_hash(&ring, &hash_key) {
             Some(url) => {
                 info!(
                     "CONSISTENT_HASH_DEBUG: Hash key '{}' mapped to worker: {}",
@@ -468,16 +478,8 @@ impl LoadBalancingPolicy for ConsistentHashPolicy {
     }
 
     fn reset(&self) {
-        // Clear the hash ring and force rebuild on next request
-        {
-            let mut ring = self.hash_ring.write().unwrap();
-            ring.clear();
-        }
-        {
-            let mut current = self.current_workers.write().unwrap();
-            current.clear();
-        }
-        info!("Consistent hash policy reset - hash ring cleared");
+        self.rings.write().unwrap().clear();
+        info!("Consistent hash policy reset - hash rings cleared");
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
