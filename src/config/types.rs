@@ -333,6 +333,8 @@ fn default_retry_jitter_factor() -> f32 {
 /// Health check configuration for worker monitoring
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    #[serde(default)]
+    pub disable_health_check: bool,
     /// Number of consecutive failures before marking unhealthy
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking healthy
@@ -348,6 +350,7 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
+            disable_health_check: false,
             failure_threshold: 3,
             success_threshold: 2,
             timeout_secs: 5,

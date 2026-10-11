@@ -43,6 +43,7 @@ pub struct Router {
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
+    disable_health_check: bool,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
@@ -58,7 +59,7 @@ impl Router {
         RouterMetrics::set_active_workers(worker_urls.len());
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
-        if !worker_urls.is_empty() {
+        if !worker_urls.is_empty() && !ctx.router_config.health_check.disable_health_check {
             Self::wait_for_healthy_workers(
                 &worker_urls,
                 ctx.router_config.worker_startup_timeout_secs,
@@ -179,6 +180,7 @@ impl Router {
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
+            disable_health_check: ctx.router_config.health_check.disable_health_check,
             _worker_loads: worker_loads,
             _load_monitor_handle: load_monitor_handle,
         })
@@ -1023,9 +1025,18 @@ impl Router {
                 ));
             }
 
-            match client.get(format!("{}/health", worker_url)).send().await {
-                Ok(res) => {
-                    if res.status().is_success() {
+            let health_check = if self.disable_health_check {
+                Ok(true)
+            } else {
+                client
+                    .get(format!("{}/health", worker_url))
+                    .send()
+                    .await
+                    .map(|response| response.status().is_success())
+            };
+            match health_check {
+                Ok(healthy) => {
+                    if healthy {
                         if self.intra_node_data_parallel_size > 1 {
                             // Expand worker URL into multiple DP-aware URLs based on configured intra_node_data_parallel_size
                             // (e.g., "http://host:8000" → "http://host:8000@0", "@1", etc.)
@@ -1118,9 +1129,8 @@ impl Router {
                         return Ok(format!("Successfully added worker: {}", worker_url));
                     } else {
                         debug!(
-                            "Worker {} health check pending - status: {}",
-                            worker_url,
-                            res.status()
+                            "Worker {} health check pending - non-success status",
+                            worker_url
                         );
                         // if the url does not have http or https prefix, warn users
                         if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
@@ -1802,8 +1812,22 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            disable_health_check: false,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disabled_health_check_registers_regular_and_dp_workers() {
+        for dp_size in [1, 2] {
+            let mut router = create_test_regular_router();
+            router.disable_health_check = true;
+            router.intra_node_data_parallel_size = dp_size;
+            router.add_worker("http://127.0.0.1:1").await.unwrap();
+            let workers = router.worker_registry.get_all();
+            assert_eq!(workers.len(), 2 + dp_size);
+            assert!(workers.iter().all(|worker| worker.is_available()));
         }
     }
 
@@ -1874,6 +1898,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            disable_health_check: false,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
         }

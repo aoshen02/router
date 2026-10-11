@@ -91,6 +91,7 @@ class Router:
         health_check_timeout_secs: Timeout in seconds for health check requests. Default: 5
         health_check_interval_secs: Interval in seconds between runtime health checks. Default: 60
         health_check_endpoint: Health check endpoint path. Default: '/health'
+        disable_health_check: Skip automatic startup, registration and periodic worker health checks when an external controller owns readiness. Default: False
     """
 
     def __init__(self, router: Optional[_Router] = None, **kwargs):
