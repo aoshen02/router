@@ -87,6 +87,7 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    disable_health_check: bool,
     // IGW (Inference Gateway) configuration
     enable_igw: bool,
     queue_size: usize,
@@ -214,6 +215,7 @@ impl Router {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: config::HealthCheckConfig {
+                disable_health_check: self.disable_health_check,
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
                 timeout_secs: self.health_check_timeout_secs,
@@ -310,6 +312,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        disable_health_check = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,6 +375,7 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        disable_health_check: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -426,6 +430,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            disable_health_check,
             enable_igw,
             queue_size,
             queue_timeout_secs,

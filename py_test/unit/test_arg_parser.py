@@ -43,6 +43,16 @@ class TestRouterArgs:
         assert args.cb_failure_threshold == 10
         assert args.disable_retries is False
         assert args.disable_circuit_breaker is False
+        assert args.disable_health_check is False
+
+    @pytest.mark.parametrize("prefix", ["", "router-"])
+    def test_disable_health_check(self, prefix):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+        parsed = parser.parse_args([f"--{prefix}disable-health-check"])
+        assert RouterArgs.from_cli_args(parsed, use_router_prefix=bool(prefix)).disable_health_check
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""

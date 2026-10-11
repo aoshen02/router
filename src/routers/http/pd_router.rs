@@ -32,6 +32,7 @@ pub struct PdRouterBase {
     pub load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     pub client: Client,
     pub circuit_breaker_config: CircuitBreakerConfig,
+    pub disable_health_check: bool,
     // Intra-node data parallel size for creating DPAwareWorker in add_*_server()
     pub dp_size: usize,
 }
@@ -39,6 +40,9 @@ pub struct PdRouterBase {
 impl PdRouterBase {
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+        if self.disable_health_check {
+            return Ok(());
+        }
         crate::routers::http::router::Router::wait_for_healthy_workers(
             &[url.to_string()],
             self.worker_startup_timeout_secs,
@@ -636,7 +640,8 @@ impl PdRouterBase {
             .map(|worker| worker.url().to_string())
             .collect();
         // At least one prefill and one decode are up
-        if !prefill_workers_urls.is_empty() {
+        if !prefill_workers_urls.is_empty() && !ctx.router_config.health_check.disable_health_check
+        {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &prefill_workers_urls,
                 ctx.router_config.worker_startup_timeout_secs,
@@ -645,7 +650,7 @@ impl PdRouterBase {
             .await?;
         }
 
-        if !decode_workers_urls.is_empty() {
+        if !decode_workers_urls.is_empty() && !ctx.router_config.health_check.disable_health_check {
             crate::routers::http::router::Router::wait_for_healthy_workers(
                 &decode_workers_urls,
                 ctx.router_config.worker_startup_timeout_secs,
@@ -704,6 +709,7 @@ impl PdRouterBase {
             load_monitor_handle,
             client: ctx.client.clone(),
             circuit_breaker_config: core_cb_config,
+            disable_health_check: ctx.router_config.health_check.disable_health_check,
             dp_size,
         })
     }
@@ -1241,7 +1247,27 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            disable_health_check: false,
             dp_size: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disabled_health_check_registers_pd_and_dp_workers() {
+        for dp_size in [1, 2] {
+            let mut router = create_test_pd_router_with_dp(dp_size);
+            router.disable_health_check = true;
+            router
+                .add_prefill_server("http://127.0.0.1:1".to_string(), None)
+                .await
+                .unwrap();
+            router
+                .add_decode_server("http://127.0.0.1:2".to_string())
+                .await
+                .unwrap();
+            let workers = router.worker_registry.get_all();
+            assert_eq!(workers.len(), 2 * dp_size);
+            assert!(workers.iter().all(|worker| worker.is_available()));
         }
     }
 
@@ -1259,6 +1285,7 @@ mod tests {
             load_monitor_handle: None,
             client: Client::new(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
+            disable_health_check: false,
             dp_size,
         }
     }

@@ -322,6 +322,9 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
+    #[arg(long, default_value_t = false)]
+    disable_health_check: bool,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -542,6 +545,7 @@ impl CliArgs {
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
             health_check: HealthCheckConfig {
+                disable_health_check: self.disable_health_check,
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
                 timeout_secs: self.health_check_timeout_secs,

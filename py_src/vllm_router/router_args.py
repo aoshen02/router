@@ -83,6 +83,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    disable_health_check: bool = False
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -440,6 +441,12 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}disable-health-check",
+            action="store_true",
+            default=RouterArgs.disable_health_check,
+            help="Disable automatic worker health checks when managed externally",
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",
