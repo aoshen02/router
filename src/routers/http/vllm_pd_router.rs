@@ -95,6 +95,47 @@ fn build_prefill_request_builder(
 }
 
 impl VllmPDRouter {
+    async fn load_mooncake_prefill_info(
+        client: &reqwest::Client,
+        url: &str,
+        bootstrap_port: Option<u16>,
+    ) -> Result<(String, MooncakePrefillInfo), String> {
+        let (url, _) = dp_utils::parse_worker_url(url);
+        let parsed = url::Url::parse(&url)
+            .map_err(|error| format!("Invalid prefill URL '{}': {}", url, error))?;
+        let host = parsed.host_str().unwrap_or("127.0.0.1");
+        let port = bootstrap_port.unwrap_or(8998);
+        let bootstrap_addr = format!("http://{}:{}", host, port);
+        let base_url = format!(
+            "{}://{}:{}",
+            parsed.scheme(),
+            host,
+            parsed.port().unwrap_or(8000)
+        );
+        info!(
+            "Querying Mooncake bootstrap at {} for prefill {}",
+            bootstrap_addr, base_url
+        );
+        let dp_engine_ids = Self::query_mooncake_bootstrap(client, &bootstrap_addr).await?;
+        if dp_engine_ids.is_empty() {
+            return Err(format!(
+                "Mooncake bootstrap at {} returned no engine IDs",
+                bootstrap_addr
+            ));
+        }
+        info!(
+            "Got Mooncake engine_ids for {}: {:?}",
+            base_url, dp_engine_ids
+        );
+        Ok((
+            base_url,
+            MooncakePrefillInfo {
+                bootstrap_addr,
+                dp_engine_ids,
+            },
+        ))
+    }
+
     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
     /// Retries with backoff since the prefill server may not be ready at router startup.
     async fn query_mooncake_bootstrap(
@@ -1609,41 +1650,10 @@ impl VllmPDRouter {
             if matches!(kv_connector, KvConnector::Mooncake) {
                 info!("Mooncake connector enabled, querying prefill bootstrap servers...");
                 for (url, bootstrap_port) in &prefill_urls {
-                    let parsed = url::Url::parse(url)
-                        .map_err(|e| format!("Invalid prefill URL '{}': {}", url, e))?;
-                    let host = parsed.host_str().unwrap_or("127.0.0.1");
-                    let port = bootstrap_port.unwrap_or(8998);
-                    let bootstrap_addr = format!("http://{}:{}", host, port);
-                    let base_url = format!(
-                        "{}://{}:{}",
-                        parsed.scheme(),
-                        host,
-                        parsed.port().unwrap_or(8000)
-                    );
-
-                    info!(
-                        "Querying Mooncake bootstrap at {} for prefill {}",
-                        bootstrap_addr, base_url
-                    );
-                    match Self::query_mooncake_bootstrap(&http_client, &bootstrap_addr).await {
-                        Ok(dp_engine_ids) => {
-                            info!(
-                                "Got Mooncake engine_ids for {}: {:?}",
-                                base_url, dp_engine_ids
-                            );
-                            mooncake_prefill_info.lock().await.insert(
-                                base_url,
-                                MooncakePrefillInfo {
-                                    bootstrap_addr,
-                                    dp_engine_ids,
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to query Mooncake bootstrap for {}: {}", base_url, e);
-                            return Err(e);
-                        }
-                    }
+                    let (base_url, info) =
+                        Self::load_mooncake_prefill_info(&http_client, url, *bootstrap_port)
+                            .await?;
+                    mooncake_prefill_info.lock().await.insert(base_url, info);
                 }
                 info!("Mooncake bootstrap query complete for all prefill nodes");
             }
@@ -1671,6 +1681,19 @@ impl VllmPDRouter {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
+        if matches!(self.kv_connector, KvConnector::Mooncake) {
+            let (base_url, info) =
+                Self::load_mooncake_prefill_info(&self.http_client, &url, bootstrap_port)
+                    .await
+                    .map_err(|message| PDRouterError::NetworkError { message })?;
+            self.pd_router.wait_for_server_health(&url).await?;
+            let mut prefill_info = self.mooncake_prefill_info.lock().await;
+            let message = self
+                .pd_router
+                .register_prefill_server(url, bootstrap_port)?;
+            prefill_info.insert(base_url, info);
+            return Ok(message);
+        }
         self.pd_router.add_prefill_server(url, bootstrap_port).await
     }
 
