@@ -540,7 +540,7 @@ async fn create_worker(
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         }
     } else {
-        // In single router mode, use the router's add_worker with basic config
+        // In single-router mode, preserve worker type for vLLM PD registration.
         let result = if let Some(router) = state.router.as_any().downcast_ref::<VllmPDRouter>() {
             match config.worker_type.as_deref() {
                 Some("prefill") => router
