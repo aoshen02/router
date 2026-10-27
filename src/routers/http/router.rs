@@ -1173,7 +1173,7 @@ impl Router {
             // Find and remove all workers with matching prefix
             let all_workers = self.worker_registry.get_all();
             for w in all_workers.iter() {
-                if w.url().starts_with(&worker_url_prefix) {
+                if w.url() == worker_url || w.url().starts_with(&worker_url_prefix) {
                     // Get model_id before removing
                     let model_id = w.model_id().to_string();
 
