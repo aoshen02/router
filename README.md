@@ -123,6 +123,12 @@ cargo run --release -- \
     --intra-node-data-parallel-size 1
 ```
 
+When a Mooncake prefiller returns `kv_transfer_params`, the router forwards that
+handoff to the decoder, preserving the identity of the engine that actually ran
+prefill. This supports internal DP load balancing without assuming producer rank
+zero. Older engines without response handoff continue using bootstrap lookup and
+require explicit DP-aware routing for multi-rank producers.
+
 ## Configuration
 
 ### Authentication

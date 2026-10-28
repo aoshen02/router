@@ -260,6 +260,12 @@ impl VllmPDRouter {
     ) -> Option<Value> {
         match self.kv_connector {
             KvConnector::Mooncake => {
+                if let Some(params) = prefill_response_json
+                    .and_then(|response| response.get("kv_transfer_params"))
+                    .filter(|params| params.is_object())
+                {
+                    return Some(params.clone());
+                }
                 let Some((bootstrap_addr, engine_id)) = self
                     .get_mooncake_info(prefill_url, prefill_dp_rank.map(|r| r as usize))
                     .await
@@ -1309,7 +1315,9 @@ impl VllmPDRouter {
 
         // Stage 2: Prepare decode request with kv_transfer_params
         let mut decode_request = original_request.clone();
-        if matches!(self.kv_connector, KvConnector::Mooncake) {
+        if matches!(self.kv_connector, KvConnector::Mooncake)
+            && !kv_transfer_params.as_ref().is_some_and(Value::is_object)
+        {
             // Mooncake: set decode params proactively from bootstrap info
             if let Some((bootstrap_addr, engine_id)) = self
                 .get_mooncake_info(&prefill_base_url, prefill_dp_rank)
