@@ -13,7 +13,7 @@ use std::sync::{
 use tokio::{net::TcpListener, sync::Notify, task::JoinHandle, time::Duration};
 use tower::ServiceExt;
 use vllm_router_rs::{
-    config::{KvConnector, RouterConfig, RoutingMode},
+    config::{ConfigValidator, KvConnector, RouterConfig, RoutingMode},
     routers::http::vllm_pd_router::VllmPDRouter,
     server::{build_app_with_request_tracing, AppContext, AppState},
 };
@@ -139,6 +139,7 @@ async fn app(
         worker_startup_check_interval_secs: 1,
         ..Default::default()
     };
+    ConfigValidator::validate(&config).unwrap();
     let context =
         Arc::new(AppContext::new(config, reqwest::Client::new(), 64, None, vec![]).unwrap());
     let router = Arc::new(
@@ -206,6 +207,40 @@ async fn generate(app: &Router) {
     .await;
     assert_eq!(response.0, StatusCode::OK, "{response:?}");
     assert_eq!(response.1["choices"][0]["text"], "ok");
+}
+
+#[tokio::test]
+async fn empty_pd_startup_serves_only_after_both_roles_register() {
+    for connector in [KvConnector::Nixl, KvConnector::Mooncake] {
+        for prefill_first in [true, false] {
+            let prefill = Backend::new().await;
+            let decode = Backend::new().await;
+            let (app, context) = app(connector, 1, None, None).await;
+            let registrations = if prefill_first {
+                [(&prefill, "prefill"), (&decode, "decode")]
+            } else {
+                [(&decode, "decode"), (&prefill, "prefill")]
+            };
+            for (worker, kind) in registrations {
+                let response = request(
+                    &app,
+                    "POST",
+                    "/v1/completions",
+                    json!({"model": "test", "prompt": "hello", "max_tokens": 2}),
+                )
+                .await;
+                assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
+                assert!(prefill.state.requests.lock().unwrap().is_empty());
+                assert!(decode.state.requests.lock().unwrap().is_empty());
+                let response = add(&app, &worker.url, kind, Some(prefill.port)).await;
+                assert_eq!(response.0, StatusCode::OK, "{response:?}");
+            }
+            assert_eq!(context.worker_registry.get_all().len(), 2);
+            generate(&app).await;
+            assert_eq!(prefill.state.requests.lock().unwrap().len(), 1);
+            assert_eq!(decode.state.requests.lock().unwrap().len(), 1);
+        }
+    }
 }
 
 #[tokio::test]
@@ -371,7 +406,7 @@ async fn mooncake_duplicate_does_not_overwrite_live_metadata() {
     prefill.set_bootstrap(json!({"0": {"engine_id": "unregistered"}}));
     let counts = context.policy_registry.get_worker_counts();
     let response = add(&app, &prefill.url, "prefill", Some(prefill.port)).await;
-    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+    assert_eq!(response.0, StatusCode::CONFLICT);
     assert!(response.1["error"]
         .as_str()
         .unwrap()
