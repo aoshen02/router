@@ -52,7 +52,9 @@ class TestRouterArgs:
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
         parsed = parser.parse_args([f"--{prefix}disable-health-check"])
-        assert RouterArgs.from_cli_args(parsed, use_router_prefix=bool(prefix)).disable_health_check
+        assert RouterArgs.from_cli_args(
+            parsed, use_router_prefix=bool(prefix)
+        ).disable_health_check
 
     def test_parse_selector_valid(self):
         """Test parsing valid selector arguments."""
@@ -449,6 +451,39 @@ class TestParseRouterArgs:
         assert router_args.port == 30001
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
+
+    @pytest.mark.parametrize(
+        "seeds, missing",
+        [
+            ([], None),
+            (["--prefill", "http://prefill:8000"], "--decode"),
+            (["--decode", "http://decode:8000"], "--prefill"),
+            (
+                ["--prefill", "http://prefill:8000", "--decode", "http://decode:8000"],
+                None,
+            ),
+        ],
+    )
+    def test_validate_pd_initial_workers(self, seeds, missing):
+        router_args = parse_router_args(["--vllm-pd-disaggregation", *seeds])
+        if missing:
+            with pytest.raises(ValueError, match=f"requires {missing}"):
+                router_args._validate_router_args()
+        else:
+            router_args._validate_router_args()
+        assert not router_args.service_discovery
+        assert router_args.vllm_discovery_address is None
+
+    @pytest.mark.parametrize(
+        "discovery",
+        [["--service-discovery"], ["--vllm-discovery-address", "127.0.0.1:9000"]],
+    )
+    @pytest.mark.parametrize("role", ["--prefill", "--decode"])
+    def test_validate_pd_discovery_allows_one_initial_role(self, discovery, role):
+        router_args = parse_router_args(
+            ["--vllm-pd-disaggregation", *discovery, role, "http://worker:8000"]
+        )
+        router_args._validate_router_args()
 
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""

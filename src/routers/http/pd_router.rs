@@ -39,7 +39,7 @@ pub struct PdRouterBase {
 
 impl PdRouterBase {
     // Private helper method to perform health check on a new server
-    async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
+    pub(crate) async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         if self.disable_health_check {
             return Ok(());
         }
@@ -242,6 +242,14 @@ impl PdRouterBase {
         // Wait for the new server to be healthy
         self.wait_for_server_health(&url).await?;
 
+        self.register_prefill_server(url, bootstrap_port)
+    }
+
+    pub(crate) fn register_prefill_server(
+        &self,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
         let worker_type = WorkerType::Prefill { bootstrap_port };
 
         if self.dp_size > 1 {

@@ -58,8 +58,7 @@ impl ConfigValidator {
                 decode_policy,
                 discovery_address: _,
             } => {
-                // Only require URLs if service discovery is disabled
-                if !has_service_discovery {
+                if !has_service_discovery && (!prefill_urls.is_empty() || !decode_urls.is_empty()) {
                     if prefill_urls.is_empty() {
                         return Err(ConfigError::ValidationFailed {
                             reason: "vLLM PD mode requires at least one prefill worker URL"
@@ -628,6 +627,75 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pd_initial_workers() {
+        for (has_prefill, has_decode, valid) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let config = RouterConfig::new(
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: if has_prefill {
+                        vec![("http://prefill:8000".to_string(), Some(8081))]
+                    } else {
+                        vec![]
+                    },
+                    decode_urls: if has_decode {
+                        vec!["http://decode:8000".to_string()]
+                    } else {
+                        vec![]
+                    },
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+                PolicyConfig::Random,
+            );
+            assert_eq!(
+                ConfigValidator::validate(&config).is_ok(),
+                valid,
+                "prefill={has_prefill}, decode={has_decode}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_pd_supplied_workers() {
+        for (prefill_url, decode_url, bootstrap_port, valid) in [
+            (
+                "http://prefill:8000",
+                "https://decode:8000",
+                Some(8081),
+                true,
+            ),
+            ("", "http://decode:8000", None, false),
+            ("invalid", "http://decode:8000", None, false),
+            ("http://", "http://decode:8000", None, false),
+            ("http://prefill:8000", "", None, false),
+            ("http://prefill:8000", "ftp://decode:8000", None, false),
+            ("http://prefill:8000", "http://", None, false),
+            ("http://prefill:8000", "http://decode:8000", Some(0), false),
+        ] {
+            let config = RouterConfig::new(
+                RoutingMode::VllmPrefillDecode {
+                    prefill_urls: vec![(prefill_url.to_string(), bootstrap_port)],
+                    decode_urls: vec![decode_url.to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                    discovery_address: None,
+                },
+                PolicyConfig::Random,
+            );
+            assert_eq!(
+                ConfigValidator::validate(&config).is_ok(),
+                valid,
+                "prefill={prefill_url}, decode={decode_url}, bootstrap={bootstrap_port:?}"
+            );
+        }
     }
 
     #[test]

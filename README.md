@@ -78,8 +78,15 @@ vllm-router \
 ```
 
 #### Prefill-Decode Disaggregation
+
+For router-before-engine startup, omit both `--prefill` and `--decode`, then
+register each role through `POST /workers` with `worker_type: "prefill"` or
+`worker_type: "decode"`. Generation returns HTTP 503 until both roles are
+available. Without service discovery, supplying initial URLs for only one role
+is rejected; supplied URLs and bootstrap ports are still validated.
+
 ```bash
-# When vLLM runs the NIXL connector, prefill/decode URLs are required.
+# Static NIXL startup uses both prefill and decode URLs.
 # See a working example in scripts/llama3.1/ folder.
 cargo run --release -- \
     --policy consistent_hash \

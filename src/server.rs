@@ -14,6 +14,7 @@ use crate::{
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     routers::{
+        http::vllm_pd_router::VllmPDRouter,
         router_manager::{RouterId, RouterManager},
         RouterFactory, RouterTrait,
     },
@@ -531,6 +532,28 @@ async fn create_worker(
         return response;
     }
 
+    if state.router_manager.is_none() {
+        let registry = &state.context.worker_registry;
+        let dp_size = state.context.router_config.intra_node_data_parallel_size;
+        let registered = registry.get_by_url(&config.url).is_some()
+            || (dp_size > 1
+                && (0..dp_size).all(|rank| {
+                    registry
+                        .get_by_url(&format!("{}@{}", config.url, rank))
+                        .is_some()
+                }));
+        if registered {
+            return (
+                StatusCode::CONFLICT,
+                Json(WorkerErrorResponse {
+                    error: format!("Worker already exists at URL '{}'", config.url),
+                    code: "WORKER_ALREADY_EXISTS".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
     // Check if we have a RouterManager (enable_igw=true)
     if let Some(router_manager) = &state.router_manager {
         // Call RouterManager's add_worker method directly with the full config
@@ -539,8 +562,23 @@ async fn create_worker(
             Err(error) => (StatusCode::BAD_REQUEST, Json(error)).into_response(),
         }
     } else {
-        // In single router mode, use the router's add_worker with basic config
-        match state.router.add_worker(&config.url).await {
+        // In single-router mode, preserve worker type for vLLM PD registration.
+        let result = if let Some(router) = state.router.as_any().downcast_ref::<VllmPDRouter>() {
+            match config.worker_type.as_deref() {
+                Some("prefill") => router
+                    .add_prefill_server(config.url, config.bootstrap_port)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Some("decode") => router
+                    .add_decode_server(config.url)
+                    .await
+                    .map_err(|error| error.to_string()),
+                _ => Err("PD workers must specify prefill or decode worker_type".to_string()),
+            }
+        } else {
+            state.router.add_worker(&config.url).await
+        };
+        match result {
             Ok(message) => {
                 let response = WorkerApiResponse {
                     success: true,

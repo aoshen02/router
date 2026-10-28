@@ -409,7 +409,11 @@ impl CliArgs {
             let use_k8s_discovery = self.service_discovery
                 && (!self.prefill_selector.is_empty() || !self.decode_selector.is_empty());
 
-            if !use_static_urls && !use_vllm_discovery && !use_k8s_discovery {
+            if self.service_discovery
+                && !use_static_urls
+                && !use_vllm_discovery
+                && !use_k8s_discovery
+            {
                 return Err(ConfigError::ValidationFailed {
                     reason: "vLLM PD disaggregation mode requires one of: --vllm-discovery-address, --prefill/--decode URLs, or --service-discovery with --prefill-selector/--decode-selector".to_string(),
                 });
@@ -438,9 +442,13 @@ impl CliArgs {
                 eprintln!("ℹ️  INFO: Using static URL mode without service discovery.");
                 eprintln!("   Prefill URLs: {:?}", prefill_urls);
                 eprintln!("   Decode URLs: {:?}", final_decode_urls);
-            } else {
+            } else if use_vllm_discovery {
                 eprintln!("ℹ️  INFO: Using vLLM ZMQ service discovery mode.");
                 eprintln!("   Discovery address: {:?}", self.vllm_discovery_address);
+            } else {
+                eprintln!(
+                    "ℹ️  INFO: Starting empty vLLM PD pools; waiting for HTTP worker registration."
+                );
             }
 
             RoutingMode::VllmPrefillDecode {
